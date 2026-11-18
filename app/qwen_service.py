@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from app.config import Settings
+from app.media_reactions import MEDIA_PROMPT_INSTRUCTION
 from app.models_catalog import DEFAULT_MODEL_KEY, MODEL_CATALOG, ModelSpec
 
 logger = logging.getLogger(__name__)
@@ -271,7 +272,7 @@ class QwenService:
         self._histories.pop(chat_id, None)
 
     def _build_messages(self, chat_id: str, user_message: str, spec: ModelSpec) -> list[dict[str, str]]:
-        system_prompt = self.settings.qwen_system_prompt
+        system_prompt = f"{self.settings.qwen_system_prompt}\n\n{MEDIA_PROMPT_INSTRUCTION}"
         if spec.disable_thinking and "/no_think" not in system_prompt:
             system_prompt = f"{system_prompt}\n/no_think"
 

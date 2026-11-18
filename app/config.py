@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     gemini_api_key: str = Field(default="", description="Google AI Studio / Gemini API key")
     gemini_max_output_tokens: int = Field(default=1024, ge=64, le=8192)
 
+    # Optional Giphy API key for live GIF search (curated hilarious GIFs work without a key)
+    giphy_api_key: str = Field(default="", description="Optional Giphy API key for dynamic GIF search")
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

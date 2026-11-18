@@ -10,7 +10,14 @@ from urllib.parse import parse_qs
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
 from app.config import Settings, get_settings
-from app.line_client import LineClient, verify_signature
+from app.line_client import LineClient, split_text_messages, verify_signature
+from app.media_reactions import (
+    build_gif_video_message,
+    build_sticker_message,
+    detect_user_media_request,
+    extract_media_tags,
+    search_giphy_gif,
+)
 from app.models_catalog import (
     MODEL_CATALOG,
     build_default_quick_reply,
@@ -47,6 +54,50 @@ DUMMY_REPLY_TOKENS = {
 }
 RESET_COMMANDS = {"/reset", "/clear"}
 MODEL_MENU_COMMANDS = {"/model", "/models", "model", "menu", "เปลี่ยนโมเดล", "เลือกโมเดล"}
+GIF_COMMAND_PREFIXES = ("/gif", "/meme", "ส่ง gif", "ส่งกิ๊ฟ", "ส่งมีม")
+STICKER_COMMAND_PREFIXES = ("/sticker", "ส่งสติกเกอร์", "ส่งสติ๊กเกอร์")
+
+
+async def _build_ai_reply_messages(
+    ai_reply: str,
+    user_text: str,
+    giphy_api_key: str = "",
+    force_sticker_mood: str | None = None,
+) -> list[dict[str, Any]]:
+    """Convert AI output (with optional [STICKER:...] or [GIF:...] tags) into LINE messages."""
+    cleaned_text, tags = extract_media_tags(ai_reply)
+    media_msg: dict[str, Any] | None = None
+
+    if tags:
+        kind, arg = tags[0]
+        if kind == "STICKER":
+            media_msg = build_sticker_message(arg)
+        elif kind == "GIF":
+            media_msg = await search_giphy_gif(arg, giphy_api_key)
+            if media_msg is None:
+                _, media_msg = build_gif_video_message(arg)
+    else:
+        requested = detect_user_media_request(user_text)
+        if requested == "GIF":
+            media_msg = await search_giphy_gif(user_text, giphy_api_key)
+            if media_msg is None:
+                _, media_msg = build_gif_video_message(user_text)
+        elif requested == "STICKER":
+            media_msg = build_sticker_message(user_text)
+        elif force_sticker_mood is not None:
+            media_msg = build_sticker_message(force_sticker_mood)
+
+    messages: list[dict[str, Any]] = []
+    if cleaned_text:
+        max_text_msgs = 4 if media_msg else 5
+        messages.extend(split_text_messages(cleaned_text, max_messages=max_text_msgs))
+    if media_msg:
+        messages.append(media_msg)
+    if not messages:
+        messages = split_text_messages(ai_reply)
+
+    messages[-1]["quickReply"] = build_default_quick_reply()
+    return messages
 
 
 def extract_chat_id(source: dict[str, Any]) -> str:
@@ -151,12 +202,43 @@ async def handle_line_event(
 
     message = event.get("message") or {}
     message_type = message.get("type")
+    giphy_api_key = getattr(getattr(qwen_service, "settings", None), "giphy_api_key", "")
+
+    if message_type == "sticker":
+        keywords = message.get("keywords") or []
+        mood_hint = ", ".join(str(k) for k in keywords[:5]) if keywords else "playful"
+        synthetic_prompt = (
+            f"[The user sent you a LINE sticker with vibe/keywords: {mood_hint}. "
+            "React in a fun, short, friendly way!]"
+        )
+        _maybe_start_loading(source, line_client)
+        try:
+            started_at = time.monotonic()
+            ai_reply = await qwen_service.generate_reply(chat_id, synthetic_prompt)
+            elapsed = time.monotonic() - started_at
+            logger.info("Reacted to user sticker for %s in %.2fs", chat_id, elapsed)
+            reply_msgs = await _build_ai_reply_messages(
+                ai_reply,
+                user_text="",
+                giphy_api_key=giphy_api_key,
+                force_sticker_mood=mood_hint,
+            )
+            await line_client.reply_messages(reply_token, reply_msgs)
+        except Exception:
+            logger.exception("Failed to react to user sticker for %s", chat_id)
+            try:
+                sticker_msg = build_sticker_message(mood_hint)
+                sticker_msg["quickReply"] = build_default_quick_reply()
+                await line_client.reply_messages(reply_token, [sticker_msg])
+            except Exception:
+                logger.exception("Failed to send fallback sticker for %s", chat_id)
+        return
 
     if message_type != "text":
         try:
             await line_client.reply_text(
                 reply_token,
-                "Currently I only support text messages. Please send a text message!",
+                "Currently I support text messages and stickers. Send a message, /model, /gif, or /sticker!",
                 quick_reply=build_default_quick_reply(),
             )
         except Exception:
@@ -192,6 +274,30 @@ async def handle_line_event(
             logger.exception("Failed to send reset confirmation for %s", chat_id)
         return
 
+    for prefix in GIF_COMMAND_PREFIXES:
+        if normalized == prefix or normalized.startswith(prefix + " "):
+            mood_arg = user_text[len(prefix) :].strip()
+            try:
+                gif_msg = await search_giphy_gif(mood_arg, giphy_api_key) if mood_arg else None
+                if gif_msg is None:
+                    _, gif_msg = build_gif_video_message(mood_arg)
+                gif_msg["quickReply"] = build_default_quick_reply()
+                await line_client.reply_messages(reply_token, [gif_msg])
+            except Exception:
+                logger.exception("Failed to send GIF for %s", chat_id)
+            return
+
+    for prefix in STICKER_COMMAND_PREFIXES:
+        if normalized == prefix or normalized.startswith(prefix + " "):
+            mood_arg = user_text[len(prefix) :].strip()
+            try:
+                sticker_msg = build_sticker_message(mood_arg)
+                sticker_msg["quickReply"] = build_default_quick_reply()
+                await line_client.reply_messages(reply_token, [sticker_msg])
+            except Exception:
+                logger.exception("Failed to send sticker for %s", chat_id)
+            return
+
     _maybe_start_loading(source, line_client)
 
     try:
@@ -206,11 +312,12 @@ async def handle_line_event(
             elapsed,
             len(ai_reply),
         )
-        await line_client.reply_text(
-            reply_token,
+        reply_msgs = await _build_ai_reply_messages(
             ai_reply,
-            quick_reply=build_default_quick_reply(),
+            user_text=user_text,
+            giphy_api_key=giphy_api_key,
         )
+        await line_client.reply_messages(reply_token, reply_msgs)
     except Exception:
         logger.exception("Error generating or sending reply for %s", chat_id)
         try:

@@ -191,13 +191,96 @@ def test_webhook_text_message_and_reset_command():
 
     assert fake_qwen.prompts == [("user:U1001", "qwen2.5-0.5b", "Hello Qwen!")]
     assert fake_qwen.resets == ["user:U1001"]
-    assert fake_line.replies == [
-        ("reply-tok-1", "[qwen2.5-0.5b] Qwen echo: Hello Qwen!"),
-        ("reply-tok-2", "Conversation history cleared."),
-    ]
-    # Normal reply attaches Quick Reply chips for changing model / resetting chat
-    quick_items = fake_line.raw_replies[0][1][0]["quickReply"]["items"]
-    assert [item["action"]["text"] for item in quick_items] == ["/model", "/reset"]
+    assert fake_line.raw_replies[0][0] == "reply-tok-1"
+    assert fake_line.raw_replies[0][1][0]["text"] == "[qwen2.5-0.5b] Qwen echo: Hello Qwen!"
+    assert fake_line.replies == [("reply-tok-2", "Conversation history cleared.")]
+    # Normal reply attaches Quick Reply chips for changing model, funny GIF, and resetting chat
+    quick_items = fake_line.raw_replies[0][1][-1]["quickReply"]["items"]
+    assert [item["action"]["text"] for item in quick_items] == ["/model", "/gif", "/reset"]
+
+
+def test_webhook_gif_sticker_commands_and_ai_media_tags():
+    app, secret, fake_line, fake_qwen = build_test_app()
+
+    async def fake_generate_with_tag(chat_id: str, user_message: str) -> str:
+        key = fake_qwen.get_chat_model_key(chat_id)
+        fake_qwen.prompts.append((chat_id, key, user_message))
+        if "wow" in user_message.lower():
+            return "That is wild! [GIF:mindblown]"
+        if "sticker" in user_message.lower():
+            return "Haha nice sticker!"
+        return "Sending love! [STICKER:love]"
+
+    fake_qwen.generate_reply = fake_generate_with_tag  # type: ignore[method-assign]
+
+    payload = {
+        "events": [
+            {
+                "type": "message",
+                "replyToken": "tok-gif",
+                "source": {"type": "user", "userId": "U5005"},
+                "message": {"type": "text", "text": "/gif facepalm"},
+            },
+            {
+                "type": "message",
+                "replyToken": "tok-sticker-cmd",
+                "source": {"type": "user", "userId": "U5005"},
+                "message": {"type": "text", "text": "/sticker laugh"},
+            },
+            {
+                "type": "message",
+                "replyToken": "tok-ai-gif",
+                "source": {"type": "user", "userId": "U5005"},
+                "message": {"type": "text", "text": "wow really?"},
+            },
+            {
+                "type": "message",
+                "replyToken": "tok-user-sticker",
+                "source": {"type": "user", "userId": "U5005"},
+                "message": {
+                    "type": "sticker",
+                    "packageId": "11537",
+                    "stickerId": "52002740",
+                    "keywords": ["laugh", "haha"],
+                },
+            },
+        ]
+    }
+    raw = json.dumps(payload).encode("utf-8")
+
+    with TestClient(app) as client:
+        res = client.post(
+            "/webhook",
+            content=raw,
+            headers={"X-Line-Signature": make_signature(raw, secret)},
+        )
+        assert res.status_code == 200
+
+    # 1. /gif facepalm -> LINE video message (MP4 + JPG preview)
+    tok0, msgs0 = fake_line.raw_replies[0]
+    assert tok0 == "tok-gif"
+    assert msgs0[0]["type"] == "video"
+    assert msgs0[0]["originalContentUrl"].endswith(".mp4")
+    assert msgs0[0]["previewImageUrl"].endswith(".jpg")
+
+    # 2. /sticker laugh -> LINE sticker message
+    tok1, msgs1 = fake_line.raw_replies[1]
+    assert tok1 == "tok-sticker-cmd"
+    assert msgs1[0]["type"] == "sticker"
+    assert msgs1[0]["packageId"] in {"446", "11537", "11538"}
+
+    # 3. AI reply with [GIF:mindblown] strips tag and attaches GIF video message
+    tok2, msgs2 = fake_line.raw_replies[2]
+    assert tok2 == "tok-ai-gif"
+    assert msgs2[0]["type"] == "text"
+    assert msgs2[0]["text"] == "That is wild!"
+    assert msgs2[1]["type"] == "video"
+
+    # 4. User sending a LINE sticker gets text reaction + LINE sticker back
+    tok3, msgs3 = fake_line.raw_replies[3]
+    assert tok3 == "tok-user-sticker"
+    assert msgs3[0]["type"] == "text"
+    assert msgs3[1]["type"] == "sticker"
 
 
 def test_webhook_model_card_and_postback_switch():

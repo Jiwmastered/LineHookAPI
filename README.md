@@ -12,6 +12,7 @@ A FastAPI webhook server for the **LINE Messaging API** that receives user messa
   - **Qwen 2.5 1.5B** (`Local · Smart`, 718 MB) — 3× larger local model for richer Thai & English replies
   - **Gemini 3.5 Lite** (`Google · Free`) — fast Google Gemini cloud model on free tier (requires `GEMINI_API_KEY`)
   - **Gemini 3.8 Flash** (`Google · Smart`) — flagship Google Gemini Flash with automatic fallback to Gemini 3.5 Lite when busy (requires `GEMINI_API_KEY`)
+- **Stickers & Hilarious GIFs**: The AI can spontaneously attach official animated LINE stickers (`[STICKER:<mood>]`) or hilarious animated GIFs (`[GIF:<mood>]`, sent via LINE Video Messages), reacts when you send it stickers, and responds to `/gif`, `/sticker`, or the **Funny GIF** quick-reply chip.
 - **Container-Ready**: Includes `Dockerfile`, `docker-compose.yml`, `railway.toml`, and `render.yaml` with CPU-only PyTorch, baked-in model weights, and non-blocking startup (`QWEN_PRELOAD_IN_BACKGROUND=true`).
 - **Responsive UX**: Returns `200 OK` to LINE immediately, shows the LINE typing/loading animation in 1-on-1 chats while generating, and replies asynchronously.
 - **Conversation Memory**: Keeps per-chat history (send `/reset` or `/clear` in LINE to reset context).

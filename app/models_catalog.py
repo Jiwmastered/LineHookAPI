@@ -194,7 +194,7 @@ def build_model_selector_flex(
 
 
 def build_default_quick_reply() -> dict[str, Any]:
-    """Quick Reply chips attached to replies so users can switch models or reset anytime."""
+    """Quick Reply chips attached to replies so users can switch models, get a GIF, or reset."""
     return {
         "items": [
             {
@@ -203,6 +203,14 @@ def build_default_quick_reply() -> dict[str, Any]:
                     "type": "message",
                     "label": "Change Model",
                     "text": "/model",
+                },
+            },
+            {
+                "type": "action",
+                "action": {
+                    "type": "message",
+                    "label": "Funny GIF",
+                    "text": "/gif",
                 },
             },
             {
