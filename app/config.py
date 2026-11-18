@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     qwen_temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     qwen_top_p: float = Field(default=0.9, ge=0.0, le=1.0)
     qwen_lazy_load: bool = Field(default=False)
+    qwen_preload_in_background: bool = Field(
+        default=False,
+        description="Load the Qwen model in a background task on startup so /health responds immediately.",
+    )
     max_history_turns: int = Field(default=6, ge=0, le=50)
 
     # Optional Ollama backend

@@ -113,13 +113,25 @@ def create_app(
             static_access_token=resolved_settings.line_channel_access_token,
         )
         app.state.qwen_service = qwen_service or QwenService(resolved_settings)
+        app.state.model_load_task = None
+
+        async def _preload_model() -> None:
+            try:
+                await app.state.qwen_service.load()
+            except Exception:
+                logger.exception("Background Qwen model preload failed.")
 
         if not resolved_settings.qwen_lazy_load:
-            await app.state.qwen_service.load()
+            if resolved_settings.qwen_preload_in_background:
+                app.state.model_load_task = asyncio.create_task(_preload_model())
+            else:
+                await app.state.qwen_service.load()
 
         try:
             yield
         finally:
+            if app.state.model_load_task and not app.state.model_load_task.done():
+                app.state.model_load_task.cancel()
             if line_client is None:
                 await app.state.line_client.aclose()
             if qwen_service is None:

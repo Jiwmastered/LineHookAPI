@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: line-qwen-webhook
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    # Note: Local Qwen2.5-0.5B-Instruct requires at least ~2 GB RAM (Standard plan or higher on Render)
+    plan: standard
+    envVars:
+      - key: LINE_CHANNEL_ID
+        sync: false
+      - key: LINE_CHANNEL_SECRET
+        sync: false
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        value: ""
+      - key: QWEN_BACKEND
+        value: local
+      - key: QWEN_MODEL_NAME
+        value: Qwen/Qwen2.5-0.5B-Instruct
+      - key: QWEN_PRELOAD_IN_BACKGROUND
+        value: "true"
+      - key: LOG_LEVEL
+        value: INFO

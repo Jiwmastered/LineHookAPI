@@ -156,3 +156,23 @@ def test_webhook_text_message_and_reset_command():
         ("reply-tok-1", "Qwen echo: Hello Qwen!"),
         ("reply-tok-2", "Conversation history cleared."),
     ]
+
+
+def test_background_preload_allows_immediate_health_check():
+    secret = "test_secret_key"
+    settings = Settings(
+        line_channel_id="12345",
+        line_channel_secret=secret,
+        qwen_lazy_load=False,
+        qwen_preload_in_background=True,
+    )
+    fake_line = FakeLineClient()
+    fake_qwen = FakeQwenService()
+    app = create_app(settings=settings, line_client=fake_line, qwen_service=fake_qwen)
+
+    with TestClient(app) as client:
+        res = client.get("/health")
+        assert res.status_code == 200
+        assert res.json()["status"] == "ok"
+
+    assert fake_qwen.loaded is True

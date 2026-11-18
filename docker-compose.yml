@@ -1,0 +1,22 @@
+services:
+  line-qwen:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PRELOAD_MODEL: "true"
+        QWEN_MODEL_NAME: "${QWEN_MODEL_NAME:-Qwen/Qwen2.5-0.5B-Instruct}"
+    container_name: line-qwen-webhook
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: "${PORT:-8000}"
+      QWEN_PRELOAD_IN_BACKGROUND: "true"
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    volumes:
+      - hf_cache:/app/.cache/huggingface
+
+volumes:
+  hf_cache:
