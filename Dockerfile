@@ -1,17 +1,14 @@
 FROM python:3.12-slim
 
-ARG QWEN_GGUF_REPO=Qwen/Qwen2.5-0.5B-Instruct-GGUF
-ARG QWEN_GGUF_FILENAME=qwen2.5-0.5b-instruct-q4_0.gguf
-ARG PRELOAD_MODEL=true
+ARG PRELOAD_MODELS=true
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/app/.cache/huggingface \
     HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
     QWEN_BACKEND=llamacpp \
-    QWEN_GGUF_REPO=${QWEN_GGUF_REPO} \
-    QWEN_GGUF_FILENAME=${QWEN_GGUF_FILENAME} \
-    QWEN_GGUF_PATH=/app/models/${QWEN_GGUF_FILENAME} \
+    QWEN_DEFAULT_MODEL_KEY=qwen2.5-0.5b \
+    QWEN_MODELS_DIR=/app/models \
     QWEN_N_CTX=1024 \
     QWEN_MAX_NEW_TOKENS=192 \
     QWEN_PRELOAD_IN_BACKGROUND=false \
@@ -27,7 +24,7 @@ RUN apt-get update \
     && mkdir -p /app/.cache/huggingface /app/models \
     && chown -R appuser:appuser /app
 
-# Install lightweight web stack + prebuilt CPU wheel for llama-cpp-python (~450 MB total RAM at runtime)
+# Install lightweight web stack + prebuilt CPU wheel for llama-cpp-python
 COPY requirements-docker.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements-docker.txt \
@@ -39,9 +36,9 @@ COPY --chown=appuser:appuser app ./app
 
 USER appuser
 
-# Pre-download the quantized Qwen GGUF file into /app/models so boot is instant and offline
-RUN if [ "$PRELOAD_MODEL" = "true" ]; then \
-      python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='${QWEN_GGUF_REPO}', filename='${QWEN_GGUF_FILENAME}', local_dir='/app/models')"; \
+# Pre-download all selectable Qwen GGUF models into /app/models so switching via LINE card is instant
+RUN if [ "$PRELOAD_MODELS" = "true" ]; then \
+      python -c "from huggingface_hub import hf_hub_download; from app.models_catalog import MODEL_CATALOG; [hf_hub_download(repo_id=m.gguf_repo, filename=m.gguf_filename, local_dir='/app/models') for m in MODEL_CATALOG.values()]"; \
     fi
 
 EXPOSE 8000

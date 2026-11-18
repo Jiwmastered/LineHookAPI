@@ -170,14 +170,25 @@ class LineClient:
         except Exception as exc:
             logger.warning("Error starting LINE loading animation: %s", exc)
 
-    async def reply_text(self, reply_token: str, text: str) -> None:
-        """Send one or more text messages using the LINE Reply Message API."""
-        messages = split_text_messages(text)
+    async def reply_messages(self, reply_token: str, messages: list[dict[str, Any]]) -> None:
+        """Send arbitrary LINE message objects (text, flex, etc.) via the Reply Message API."""
         response = await self._post_with_auth(
             LINE_REPLY_MESSAGE_URL,
             {
                 "replyToken": reply_token,
-                "messages": messages,
+                "messages": messages[:LINE_MAX_MESSAGES_PER_REPLY],
             },
         )
         response.raise_for_status()
+
+    async def reply_text(
+        self,
+        reply_token: str,
+        text: str,
+        quick_reply: dict[str, Any] | None = None,
+    ) -> None:
+        """Send one or more text messages using the LINE Reply Message API."""
+        messages: list[dict[str, Any]] = split_text_messages(text)
+        if quick_reply and messages:
+            messages[-1]["quickReply"] = quick_reply
+        await self.reply_messages(reply_token, messages)

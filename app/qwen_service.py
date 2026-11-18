@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import logging
 import os
 import re
@@ -9,22 +10,24 @@ from typing import Any
 import httpx
 
 from app.config import Settings
+from app.models_catalog import DEFAULT_MODEL_KEY, MODEL_CATALOG, ModelSpec
 
 logger = logging.getLogger(__name__)
 
 THINK_TAG_PATTERN = re.compile(r"<think>.*?</think>\s*", flags=re.DOTALL)
+UNCLOSED_THINK_PATTERN = re.compile(r"<think>.*", flags=re.DOTALL)
 
 
 def clean_model_output(text: str) -> str:
     """Strip reasoning tags (e.g. Qwen3 <think> blocks) and trim whitespace."""
-    cleaned = THINK_TAG_PATTERN.sub("", text).strip()
+    cleaned = THINK_TAG_PATTERN.sub("", text)
+    cleaned = UNCLOSED_THINK_PATTERN.sub("", cleaned).strip()
     return cleaned or text.strip()
 
 
 def detect_cpu_threads(cap: int = 4) -> int:
     """Detect effective CPU threads respecting Linux cgroup CPU quotas."""
     try:
-        # cgroup v2: "<quota> <period>" or "max <period>"
         cpu_max = Path("/sys/fs/cgroup/cpu.max")
         if cpu_max.exists():
             parts = cpu_max.read_text(encoding="utf-8").strip().split()
@@ -38,15 +41,21 @@ def detect_cpu_threads(cap: int = 4) -> int:
 
 
 class QwenService:
-    """Runs a Qwen chat model locally in-process (llama.cpp GGUF or transformers) or via Ollama."""
+    """Runs Qwen chat models locally in-process (llama.cpp GGUF or transformers) or via Ollama."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._default_model_key: str = (
+            settings.qwen_default_model_key
+            if settings.qwen_default_model_key in MODEL_CATALOG
+            else DEFAULT_MODEL_KEY
+        )
+        self._chat_models: dict[str, str] = {}
+        self._loaded_model_key: str | None = None
         self._tokenizer: Any = None
         self._model: Any = None
         self._llama: Any = None
         self._device: str = "cpu"
-        self._load_lock = asyncio.Lock()
         self._infer_lock = asyncio.Lock()
         self._histories: dict[str, deque[dict[str, str]]] = {}
         self._http: httpx.AsyncClient | None = None
@@ -60,55 +69,130 @@ class QwenService:
         return self._model is not None and self._tokenizer is not None
 
     @property
-    def active_model_name(self) -> str:
+    def loaded_model_key(self) -> str | None:
         if self.settings.qwen_backend == "ollama":
-            return self.settings.ollama_model_name
+            return self._default_model_key
+        return self._loaded_model_key
+
+    @property
+    def active_model_name(self) -> str:
+        key = self._loaded_model_key or self._default_model_key
+        spec = MODEL_CATALOG.get(key)
+        if self.settings.qwen_backend == "ollama":
+            return spec.ollama_model if spec else self.settings.ollama_model_name
         if self.settings.qwen_backend == "llamacpp":
+            if spec:
+                return spec.gguf_filename
             if self.settings.qwen_gguf_path:
                 return Path(self.settings.qwen_gguf_path).name
             return f"{self.settings.qwen_gguf_repo}/{self.settings.qwen_gguf_filename}"
-        return self.settings.qwen_model_name
+        return spec.hf_model if spec else self.settings.qwen_model_name
 
-    async def load(self) -> None:
-        """Load the Qwen model into memory (local or llamacpp backend)."""
+    def get_chat_model_key(self, chat_id: str) -> str:
+        return self._chat_models.get(chat_id, self._default_model_key)
+
+    def get_model_spec(self, model_key: str) -> ModelSpec:
+        if model_key not in MODEL_CATALOG:
+            raise ValueError(f"Unknown model key: {model_key}")
+        return MODEL_CATALOG[model_key]
+
+    async def load(self, model_key: str | None = None) -> None:
+        """Load the specified (or default) Qwen model into memory."""
+        target_key = model_key or self._default_model_key
+        if target_key not in MODEL_CATALOG:
+            target_key = self._default_model_key
+
         if self.settings.qwen_backend == "ollama":
             logger.info(
                 "Using Ollama backend at %s with model %s",
                 self.settings.ollama_base_url,
-                self.settings.ollama_model_name,
+                MODEL_CATALOG[target_key].ollama_model,
             )
             return
 
-        if self.is_loaded:
+        async with self._infer_lock:
+            await self._ensure_model_loaded_locked(target_key)
+
+    async def select_model(self, chat_id: str, model_key: str) -> ModelSpec:
+        """Switch the active model for chat_id and preload it in memory."""
+        spec = self.get_model_spec(model_key)
+        self._chat_models[chat_id] = model_key
+
+        if self.settings.qwen_backend != "ollama":
+            async with self._infer_lock:
+                await self._ensure_model_loaded_locked(model_key)
+
+        return spec
+
+    async def _ensure_model_loaded_locked(self, model_key: str) -> None:
+        """Ensure model_key is loaded (caller must hold self._infer_lock)."""
+        if self._loaded_model_key == model_key and self.is_loaded:
             return
 
-        async with self._load_lock:
-            if self.is_loaded:
-                return
-            if self.settings.qwen_backend == "llamacpp":
-                await asyncio.to_thread(self._load_llamacpp_model_sync)
-            else:
-                await asyncio.to_thread(self._load_local_model_sync)
+        spec = self.get_model_spec(model_key)
+        if self.settings.qwen_backend == "llamacpp":
+            await asyncio.to_thread(self._switch_llamacpp_model_sync, spec)
+        else:
+            await asyncio.to_thread(self._switch_local_model_sync, spec)
+        self._loaded_model_key = model_key
 
-    def _load_llamacpp_model_sync(self) -> None:
+    def _unload_current_model_sync(self) -> None:
+        """Free the currently loaded model before loading another to avoid OOM."""
+        if self._llama is not None:
+            try:
+                close_fn = getattr(self._llama, "close", None)
+                if callable(close_fn):
+                    close_fn()
+            except Exception:
+                logger.warning("Failed to close previous Llama instance cleanly.", exc_info=True)
+            self._llama = None
+
+        if self._model is not None or self._tokenizer is not None:
+            self._model = None
+            self._tokenizer = None
+
+        self._loaded_model_key = None
+        gc.collect()
+
+    def _resolve_gguf_path(self, spec: ModelSpec) -> str:
+        if self.settings.qwen_models_dir:
+            candidate = Path(self.settings.qwen_models_dir) / spec.gguf_filename
+            if candidate.exists():
+                return str(candidate)
+
+        if (
+            spec.key == self._default_model_key
+            and self.settings.qwen_gguf_path.strip()
+            and os.path.exists(self.settings.qwen_gguf_path.strip())
+        ):
+            return self.settings.qwen_gguf_path.strip()
+
         from huggingface_hub import hf_hub_download
+
+        logger.info(
+            "Downloading GGUF model %s/%s from Hugging Face...",
+            spec.gguf_repo,
+            spec.gguf_filename,
+        )
+        download_kwargs: dict[str, Any] = {
+            "repo_id": spec.gguf_repo,
+            "filename": spec.gguf_filename,
+        }
+        if self.settings.qwen_models_dir:
+            Path(self.settings.qwen_models_dir).mkdir(parents=True, exist_ok=True)
+            download_kwargs["local_dir"] = self.settings.qwen_models_dir
+        return hf_hub_download(**download_kwargs)
+
+    def _switch_llamacpp_model_sync(self, spec: ModelSpec) -> None:
         from llama_cpp import Llama
 
-        model_path = self.settings.qwen_gguf_path.strip()
-        if not model_path or not os.path.exists(model_path):
-            logger.info(
-                "Downloading GGUF model %s/%s from Hugging Face...",
-                self.settings.qwen_gguf_repo,
-                self.settings.qwen_gguf_filename,
-            )
-            model_path = hf_hub_download(
-                repo_id=self.settings.qwen_gguf_repo,
-                filename=self.settings.qwen_gguf_filename,
-            )
+        self._unload_current_model_sync()
+        model_path = self._resolve_gguf_path(spec)
 
         n_threads = self.settings.qwen_n_threads or detect_cpu_threads()
         logger.info(
-            "Loading GGUF Qwen model from '%s' (n_ctx=%s, n_threads=%s)...",
+            "Loading GGUF Qwen model '%s' from '%s' (n_ctx=%s, n_threads=%s)...",
+            spec.label,
             model_path,
             self.settings.qwen_n_ctx,
             n_threads,
@@ -124,13 +208,19 @@ class QwenService:
             use_mlock=False,
             verbose=False,
         )
-        logger.info("GGUF Qwen model '%s' loaded successfully.", model_path)
+        logger.info("GGUF Qwen model '%s' loaded successfully.", spec.label)
 
-    def _load_local_model_sync(self) -> None:
+    def _switch_local_model_sync(self, spec: ModelSpec) -> None:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        model_name = self.settings.qwen_model_name
+        self._unload_current_model_sync()
+
+        model_name = (
+            self.settings.qwen_model_name
+            if spec.key == self._default_model_key and self.settings.qwen_model_name
+            else spec.hf_model
+        )
         if torch.cuda.is_available():
             self._device = "cuda"
             dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -162,6 +252,7 @@ class QwenService:
         logger.info("Qwen model '%s' loaded successfully on %s.", model_name, self._device)
 
     async def aclose(self) -> None:
+        self._unload_current_model_sync()
         if self._http is not None:
             await self._http.aclose()
             self._http = None
@@ -169,10 +260,12 @@ class QwenService:
     def reset_history(self, chat_id: str) -> None:
         self._histories.pop(chat_id, None)
 
-    def _build_messages(self, chat_id: str, user_message: str) -> list[dict[str, str]]:
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": self.settings.qwen_system_prompt}
-        ]
+    def _build_messages(self, chat_id: str, user_message: str, spec: ModelSpec) -> list[dict[str, str]]:
+        system_prompt = self.settings.qwen_system_prompt
+        if spec.disable_thinking and "/no_think" not in system_prompt:
+            system_prompt = f"{system_prompt}\n/no_think"
+
+        messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
         history = self._histories.get(chat_id)
         if history:
             messages.extend(history)
@@ -191,20 +284,20 @@ class QwenService:
         history.append({"role": "assistant", "content": assistant_reply})
 
     async def generate_reply(self, chat_id: str, user_message: str) -> str:
-        """Generate an AI reply for a given chat_id and user message."""
-        messages = self._build_messages(chat_id, user_message)
+        """Generate an AI reply for a given chat_id and user message using its selected model."""
+        model_key = self.get_chat_model_key(chat_id)
+        spec = self.get_model_spec(model_key)
+        messages = self._build_messages(chat_id, user_message, spec)
 
         if self.settings.qwen_backend == "ollama":
-            reply = await self._generate_ollama(messages)
+            reply = await self._generate_ollama(messages, spec)
         elif self.settings.qwen_backend == "llamacpp":
-            if not self.is_loaded:
-                await self.load()
             async with self._infer_lock:
+                await self._ensure_model_loaded_locked(model_key)
                 reply = await asyncio.to_thread(self._generate_llamacpp_sync, messages)
         else:
-            if not self.is_loaded:
-                await self.load()
             async with self._infer_lock:
+                await self._ensure_model_loaded_locked(model_key)
                 reply = await asyncio.to_thread(self._generate_local_sync, messages)
 
         reply = clean_model_output(reply)
@@ -265,7 +358,7 @@ class QwenService:
         output_ids = generated_ids[0][input_length:]
         return self._tokenizer.decode(output_ids, skip_special_tokens=True).strip()
 
-    async def _generate_ollama(self, messages: list[dict[str, str]]) -> str:
+    async def _generate_ollama(self, messages: list[dict[str, str]], spec: ModelSpec) -> str:
         if self._http is None:
             self._http = httpx.AsyncClient(timeout=120.0)
 
@@ -273,7 +366,7 @@ class QwenService:
         response = await self._http.post(
             url,
             json={
-                "model": self.settings.ollama_model_name,
+                "model": spec.ollama_model,
                 "messages": messages,
                 "stream": False,
                 "options": {

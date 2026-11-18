@@ -5,11 +5,17 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import parse_qs
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
 from app.config import Settings, get_settings
 from app.line_client import LineClient, verify_signature
+from app.models_catalog import (
+    MODEL_CATALOG,
+    build_default_quick_reply,
+    build_model_selector_flex,
+)
 from app.qwen_service import QwenService
 
 logger = logging.getLogger(__name__)
@@ -33,11 +39,13 @@ def configure_logging(level_name: str) -> None:
     root.setLevel(level)
     root.handlers = [stdout_handler, stderr_handler]
 
+
 DUMMY_REPLY_TOKENS = {
     "00000000000000000000000000000000",
     "ffffffffffffffffffffffffffffffff",
 }
 RESET_COMMANDS = {"/reset", "/clear"}
+MODEL_MENU_COMMANDS = {"/model", "/models", "model", "menu", "เปลี่ยนโมเดล", "เลือกโมเดล"}
 
 
 def extract_chat_id(source: dict[str, Any]) -> str:
@@ -52,22 +60,92 @@ def extract_chat_id(source: dict[str, Any]) -> str:
     return f"{source_type}:unknown"
 
 
+def _maybe_start_loading(source: dict[str, Any], line_client: LineClient) -> None:
+    if source.get("type") == "user" and source.get("userId"):
+        asyncio.create_task(
+            line_client.start_loading_animation(source["userId"], loading_seconds=60)
+        )
+
+
 async def handle_line_event(
     event: dict[str, Any],
     line_client: LineClient,
     qwen_service: QwenService,
 ) -> None:
     """Process a single LINE webhook event in the background."""
-    if event.get("type") != "message":
-        return
-
     reply_token = event.get("replyToken")
     if not reply_token or reply_token in DUMMY_REPLY_TOKENS:
         logger.debug("Skipping event without a real replyToken.")
         return
 
+    event_type = event.get("type")
     source = event.get("source") or {}
     chat_id = extract_chat_id(source)
+
+    if event_type == "follow":
+        active_key = qwen_service.get_chat_model_key(chat_id)
+        try:
+            await line_client.reply_messages(
+                reply_token,
+                [
+                    {
+                        "type": "text",
+                        "text": "Welcome! Pick a Qwen AI model below or send any message to start chatting. Type /model anytime to switch models.",
+                    },
+                    build_model_selector_flex(active_key),
+                ],
+            )
+        except Exception:
+            logger.exception("Failed to send follow welcome card for %s", chat_id)
+        return
+
+    if event_type == "postback":
+        postback_data = str((event.get("postback") or {}).get("data", ""))
+        params = parse_qs(postback_data)
+        action = (params.get("action") or [""])[0]
+        model_key = (params.get("model") or [""])[0]
+
+        if action == "select_model":
+            if model_key not in MODEL_CATALOG:
+                active_key = qwen_service.get_chat_model_key(chat_id)
+                try:
+                    await line_client.reply_messages(
+                        reply_token,
+                        [
+                            {"type": "text", "text": "Unknown model selection. Please pick one below:"},
+                            build_model_selector_flex(active_key),
+                        ],
+                    )
+                except Exception:
+                    logger.exception("Failed to send invalid-model fallback for %s", chat_id)
+                return
+
+            _maybe_start_loading(source, line_client)
+            try:
+                started_at = time.monotonic()
+                spec = await qwen_service.select_model(chat_id, model_key)
+                elapsed = time.monotonic() - started_at
+                logger.info("Switched %s to model '%s' in %.2fs", chat_id, spec.key, elapsed)
+                await line_client.reply_text(
+                    reply_token,
+                    f"Switched to {spec.label} ({spec.tier}).\nSend a message to start chatting!",
+                    quick_reply=build_default_quick_reply(),
+                )
+            except Exception:
+                logger.exception("Error switching model to '%s' for %s", model_key, chat_id)
+                try:
+                    await line_client.reply_text(
+                        reply_token,
+                        "Sorry, I could not switch to that model right now. Please try again.",
+                        quick_reply=build_default_quick_reply(),
+                    )
+                except Exception:
+                    logger.exception("Failed to send model-switch error fallback for %s", chat_id)
+        return
+
+    if event_type != "message":
+        return
+
     message = event.get("message") or {}
     message_type = message.get("type")
 
@@ -76,6 +154,7 @@ async def handle_line_event(
             await line_client.reply_text(
                 reply_token,
                 "Currently I only support text messages. Please send a text message!",
+                quick_reply=build_default_quick_reply(),
             )
         except Exception:
             logger.exception("Failed to send non-text fallback reply for %s", chat_id)
@@ -85,32 +164,57 @@ async def handle_line_event(
     if not user_text:
         return
 
-    if user_text.lower() in RESET_COMMANDS:
+    normalized = user_text.lower()
+
+    if normalized in MODEL_MENU_COMMANDS:
+        active_key = qwen_service.get_chat_model_key(chat_id)
+        try:
+            await line_client.reply_messages(
+                reply_token,
+                [build_model_selector_flex(active_key)],
+            )
+        except Exception:
+            logger.exception("Failed to send model selector card for %s", chat_id)
+        return
+
+    if normalized in RESET_COMMANDS:
         qwen_service.reset_history(chat_id)
         try:
-            await line_client.reply_text(reply_token, "Conversation history cleared.")
+            await line_client.reply_text(
+                reply_token,
+                "Conversation history cleared.",
+                quick_reply=build_default_quick_reply(),
+            )
         except Exception:
             logger.exception("Failed to send reset confirmation for %s", chat_id)
         return
 
-    # Show typing indicator in 1-on-1 chats while Qwen generates the reply
-    if source.get("type") == "user" and source.get("userId"):
-        asyncio.create_task(
-            line_client.start_loading_animation(source["userId"], loading_seconds=60)
-        )
+    _maybe_start_loading(source, line_client)
 
     try:
         started_at = time.monotonic()
         ai_reply = await qwen_service.generate_reply(chat_id, user_text)
         elapsed = time.monotonic() - started_at
-        logger.info("Generated Qwen reply for %s in %.2fs (%d chars)", chat_id, elapsed, len(ai_reply))
-        await line_client.reply_text(reply_token, ai_reply)
+        active_key = qwen_service.get_chat_model_key(chat_id)
+        logger.info(
+            "Generated reply for %s using '%s' in %.2fs (%d chars)",
+            chat_id,
+            active_key,
+            elapsed,
+            len(ai_reply),
+        )
+        await line_client.reply_text(
+            reply_token,
+            ai_reply,
+            quick_reply=build_default_quick_reply(),
+        )
     except Exception:
         logger.exception("Error generating or sending reply for %s", chat_id)
         try:
             await line_client.reply_text(
                 reply_token,
                 "Sorry, an error occurred while generating a response. Please try again.",
+                quick_reply=build_default_quick_reply(),
             )
         except Exception:
             logger.exception("Failed to send error fallback message for %s", chat_id)
@@ -160,7 +264,7 @@ def create_app(
 
     app = FastAPI(
         title="LINE Qwen Webhook Server",
-        version="1.0.0",
+        version="1.1.0",
         lifespan=lifespan,
     )
 
@@ -180,6 +284,8 @@ def create_app(
             "status": "ok",
             "backend": cfg.qwen_backend,
             "model": svc.active_model_name,
+            "loaded_model_key": svc.loaded_model_key,
+            "available_models": list(MODEL_CATALOG.keys()),
             "model_loaded": svc.is_loaded,
         }
 

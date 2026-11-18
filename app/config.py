@@ -29,6 +29,11 @@ class Settings(BaseSettings):
 
     # Qwen Model
     qwen_backend: Literal["local", "llamacpp", "ollama"] = Field(default="local")
+    qwen_default_model_key: str = Field(default="qwen2.5-0.5b")
+    qwen_models_dir: str = Field(
+        default="",
+        description="Directory containing pre-downloaded .gguf model files (e.g. /app/models).",
+    )
     qwen_model_name: str = Field(default="Qwen/Qwen2.5-0.5B-Instruct")
     qwen_gguf_repo: str = Field(default="Qwen/Qwen2.5-0.5B-Instruct-GGUF")
     qwen_gguf_filename: str = Field(default="qwen2.5-0.5b-instruct-q4_0.gguf")
