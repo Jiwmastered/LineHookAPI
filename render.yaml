@@ -14,10 +14,12 @@ services:
       - key: LINE_CHANNEL_ACCESS_TOKEN
         value: ""
       - key: QWEN_BACKEND
-        value: local
-      - key: QWEN_MODEL_NAME
-        value: Qwen/Qwen2.5-0.5B-Instruct
-      - key: QWEN_PRELOAD_IN_BACKGROUND
-        value: "true"
+        value: llamacpp
+      - key: QWEN_GGUF_REPO
+        value: Qwen/Qwen2.5-0.5B-Instruct-GGUF
+      - key: QWEN_GGUF_FILENAME
+        value: qwen2.5-0.5b-instruct-q4_0.gguf
+      - key: QWEN_N_CTX
+        value: "1024"
       - key: LOG_LEVEL
         value: INFO

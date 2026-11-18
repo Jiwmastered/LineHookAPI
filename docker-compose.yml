@@ -5,14 +5,16 @@ services:
       dockerfile: Dockerfile
       args:
         PRELOAD_MODEL: "true"
-        QWEN_MODEL_NAME: "${QWEN_MODEL_NAME:-Qwen/Qwen2.5-0.5B-Instruct}"
+        QWEN_GGUF_REPO: "${QWEN_GGUF_REPO:-Qwen/Qwen2.5-0.5B-Instruct-GGUF}"
+        QWEN_GGUF_FILENAME: "${QWEN_GGUF_FILENAME:-qwen2.5-0.5b-instruct-q4_0.gguf}"
     container_name: line-qwen-webhook
     restart: unless-stopped
     env_file:
       - .env
     environment:
       PORT: "${PORT:-8000}"
-      QWEN_PRELOAD_IN_BACKGROUND: "true"
+      QWEN_BACKEND: "llamacpp"
+      QWEN_N_CTX: "${QWEN_N_CTX:-1024}"
     ports:
       - "${PORT:-8000}:${PORT:-8000}"
     volumes:

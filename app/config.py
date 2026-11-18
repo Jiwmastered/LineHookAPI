@@ -28,8 +28,16 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO")
 
     # Qwen Model
-    qwen_backend: Literal["local", "ollama"] = Field(default="local")
+    qwen_backend: Literal["local", "llamacpp", "ollama"] = Field(default="local")
     qwen_model_name: str = Field(default="Qwen/Qwen2.5-0.5B-Instruct")
+    qwen_gguf_repo: str = Field(default="Qwen/Qwen2.5-0.5B-Instruct-GGUF")
+    qwen_gguf_filename: str = Field(default="qwen2.5-0.5b-instruct-q4_0.gguf")
+    qwen_gguf_path: str = Field(
+        default="",
+        description="Optional local filesystem path to a pre-downloaded .gguf model file.",
+    )
+    qwen_n_ctx: int = Field(default=2048, ge=256, le=32768)
+    qwen_n_threads: int = Field(default=0, ge=0, le=128)
     qwen_system_prompt: str = Field(
         default="You are a helpful, concise AI assistant on LINE. Reply in the same language as the user."
     )

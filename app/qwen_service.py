@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import os
 import re
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -20,12 +22,13 @@ def clean_model_output(text: str) -> str:
 
 
 class QwenService:
-    """Runs a Qwen chat model locally in-process (transformers) or via Ollama."""
+    """Runs a Qwen chat model locally in-process (llama.cpp GGUF or transformers) or via Ollama."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._tokenizer: Any = None
         self._model: Any = None
+        self._llama: Any = None
         self._device: str = "cpu"
         self._load_lock = asyncio.Lock()
         self._infer_lock = asyncio.Lock()
@@ -36,17 +39,23 @@ class QwenService:
     def is_loaded(self) -> bool:
         if self.settings.qwen_backend == "ollama":
             return True
+        if self.settings.qwen_backend == "llamacpp":
+            return self._llama is not None
         return self._model is not None and self._tokenizer is not None
 
     @property
     def active_model_name(self) -> str:
         if self.settings.qwen_backend == "ollama":
             return self.settings.ollama_model_name
+        if self.settings.qwen_backend == "llamacpp":
+            if self.settings.qwen_gguf_path:
+                return Path(self.settings.qwen_gguf_path).name
+            return f"{self.settings.qwen_gguf_repo}/{self.settings.qwen_gguf_filename}"
         return self.settings.qwen_model_name
 
     async def load(self) -> None:
-        """Load the Qwen model into memory (local backend only)."""
-        if self.settings.qwen_backend != "local":
+        """Load the Qwen model into memory (local or llamacpp backend)."""
+        if self.settings.qwen_backend == "ollama":
             logger.info(
                 "Using Ollama backend at %s with model %s",
                 self.settings.ollama_base_url,
@@ -60,7 +69,45 @@ class QwenService:
         async with self._load_lock:
             if self.is_loaded:
                 return
-            await asyncio.to_thread(self._load_local_model_sync)
+            if self.settings.qwen_backend == "llamacpp":
+                await asyncio.to_thread(self._load_llamacpp_model_sync)
+            else:
+                await asyncio.to_thread(self._load_local_model_sync)
+
+    def _load_llamacpp_model_sync(self) -> None:
+        from huggingface_hub import hf_hub_download
+        from llama_cpp import Llama
+
+        model_path = self.settings.qwen_gguf_path.strip()
+        if not model_path or not os.path.exists(model_path):
+            logger.info(
+                "Downloading GGUF model %s/%s from Hugging Face...",
+                self.settings.qwen_gguf_repo,
+                self.settings.qwen_gguf_filename,
+            )
+            model_path = hf_hub_download(
+                repo_id=self.settings.qwen_gguf_repo,
+                filename=self.settings.qwen_gguf_filename,
+            )
+
+        n_threads = self.settings.qwen_n_threads or max(1, min(os.cpu_count() or 2, 4))
+        logger.info(
+            "Loading GGUF Qwen model from '%s' (n_ctx=%s, n_threads=%s)...",
+            model_path,
+            self.settings.qwen_n_ctx,
+            n_threads,
+        )
+
+        self._llama = Llama(
+            model_path=model_path,
+            n_ctx=self.settings.qwen_n_ctx,
+            n_threads=n_threads,
+            n_batch=128,
+            use_mmap=True,
+            use_mlock=False,
+            verbose=False,
+        )
+        logger.info("GGUF Qwen model '%s' loaded successfully.", model_path)
 
     def _load_local_model_sync(self) -> None:
         import torch
@@ -132,6 +179,11 @@ class QwenService:
 
         if self.settings.qwen_backend == "ollama":
             reply = await self._generate_ollama(messages)
+        elif self.settings.qwen_backend == "llamacpp":
+            if not self.is_loaded:
+                await self.load()
+            async with self._infer_lock:
+                reply = await asyncio.to_thread(self._generate_llamacpp_sync, messages)
         else:
             if not self.is_loaded:
                 await self.load()
@@ -141,6 +193,19 @@ class QwenService:
         reply = clean_model_output(reply)
         self._record_turn(chat_id, user_message, reply)
         return reply
+
+    def _generate_llamacpp_sync(self, messages: list[dict[str, str]]) -> str:
+        assert self._llama is not None
+        response = self._llama.create_chat_completion(
+            messages=messages,
+            max_tokens=self.settings.qwen_max_new_tokens,
+            temperature=self.settings.qwen_temperature,
+            top_p=self.settings.qwen_top_p,
+        )
+        choices = response.get("choices") or []
+        if not choices:
+            return ""
+        return str(choices[0].get("message", {}).get("content", "")).strip()
 
     def _generate_local_sync(self, messages: list[dict[str, str]]) -> str:
         import torch
