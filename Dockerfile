@@ -36,9 +36,9 @@ COPY --chown=appuser:appuser app ./app
 
 USER appuser
 
-# Pre-download all selectable Qwen GGUF models into /app/models so switching via LINE card is instant
+# Pre-download all selectable local Qwen GGUF models into /app/models so switching via LINE card is instant
 RUN if [ "$PRELOAD_MODELS" = "true" ]; then \
-      python -c "from huggingface_hub import hf_hub_download; from app.models_catalog import MODEL_CATALOG; [hf_hub_download(repo_id=m.gguf_repo, filename=m.gguf_filename, local_dir='/app/models') for m in MODEL_CATALOG.values()]"; \
+      python -c "from huggingface_hub import hf_hub_download; from app.models_catalog import MODEL_CATALOG; [hf_hub_download(repo_id=m.gguf_repo, filename=m.gguf_filename, local_dir='/app/models') for m in MODEL_CATALOG.values() if m.provider == 'local']"; \
     fi
 
 EXPOSE 8000

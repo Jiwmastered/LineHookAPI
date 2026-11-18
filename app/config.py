@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     ollama_base_url: str = Field(default="http://127.0.0.1:11434")
     ollama_model_name: str = Field(default="qwen2.5:1.5b")
 
+    # Optional Google Gemini API (free tier supported)
+    gemini_api_key: str = Field(default="", description="Google AI Studio / Gemini API key")
+    gemini_max_output_tokens: int = Field(default=1024, ge=64, le=8192)
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

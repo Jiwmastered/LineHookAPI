@@ -47,6 +47,10 @@ class FakeQwenService:
         self.resets: list[str] = []
 
     @property
+    def gemini_enabled(self) -> bool:
+        return True
+
+    @property
     def is_loaded(self) -> bool:
         return self.loaded
 

@@ -1,7 +1,10 @@
+import json
+
+import httpx
 import pytest
 
 from app.config import Settings
-from app.models_catalog import MODEL_CATALOG, build_model_selector_flex
+from app.models_catalog import MODEL_CATALOG, build_model_selector_flex, get_available_models
 from app.qwen_service import QwenService
 
 
@@ -68,7 +71,7 @@ async def test_llamacpp_backend_reply_history_and_model_switch():
 
     # Switch to smarter Qwen2.5 1.5B
     spec_smart = await svc.select_model("user:1", "qwen2.5-1.5b")
-    assert spec_smart.tier == "Smart"
+    assert "Smart" in spec_smart.tier
     assert created_instances[1].closed is True
     assert svc.active_model_name == "qwen2.5-1.5b-instruct-q2_k.gguf"
 
@@ -77,11 +80,68 @@ async def test_llamacpp_backend_reply_history_and_model_switch():
     assert len(created_instances[2].calls[0]) == 2
 
 
-def test_model_selector_flex_marks_active_model():
-    flex = build_model_selector_flex("qwen2.5-1.5b")
-    assert flex["type"] == "flex"
-    bubbles = flex["contents"]["contents"]
-    assert len(bubbles) == len(MODEL_CATALOG)
-    active_headers = [b["header"]["contents"][0]["text"] for b in bubbles]
+@pytest.mark.asyncio
+async def test_gemini_generation_and_503_fallback():
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("x-goog-api-key") == "test-gemini-key"
+        url = str(request.url)
+        calls.append(url)
+        body = json.loads(request.content.decode("utf-8"))
+        assert body["contents"][-1]["role"] == "user"
+
+        if "gemini-3.8-flash" in url:
+            return httpx.Response(503, json={"error": {"code": 503, "status": "UNAVAILABLE"}})
+        if "gemini-3.5-flash-lite" in url:
+            return httpx.Response(
+                200,
+                json={
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {"text": "hidden thought", "thought": True},
+                                    {"text": "Hello from Google Gemini!"},
+                                ]
+                            }
+                        }
+                    ]
+                },
+            )
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    settings = Settings(
+        qwen_backend="llamacpp",
+        gemini_api_key="test-gemini-key",
+    )
+    svc = QwenService(settings)
+    svc._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    # Selecting Gemini does not touch local GGUF loading
+    spec = await svc.select_model("user:g1", "gemini-3.8-flash")
+    assert spec.provider == "gemini"
+    assert svc.is_loaded is False
+
+    # 503 on 3.8 Flash falls back smoothly to 3.5 Flash-Lite
+    reply = await svc.generate_reply("user:g1", "Hi Gemini!")
+    assert "Hello from Google Gemini!" in reply
+    assert "Gemini 3.5 Lite" in reply
+    assert any("gemini-3.8-flash" in u for u in calls)
+    assert any("gemini-3.5-flash-lite" in u for u in calls)
+
+    await svc.aclose()
+
+
+def test_model_selector_flex_respects_gemini_flag():
+    flex_all = build_model_selector_flex("gemini-3.5-flash-lite", gemini_enabled=True)
+    bubbles_all = flex_all["contents"]["contents"]
+    assert len(bubbles_all) == len(MODEL_CATALOG)
+    active_headers = [b["header"]["contents"][0]["text"] for b in bubbles_all]
     assert active_headers.count("ACTIVE MODEL") == 1
-    assert active_headers[2] == "ACTIVE MODEL"
+    assert active_headers[3] == "ACTIVE MODEL"
+
+    local_only = get_available_models(gemini_enabled=False)
+    assert all(m.provider == "local" for m in local_only.values())
+    flex_local = build_model_selector_flex("qwen2.5-1.5b", gemini_enabled=False)
+    assert len(flex_local["contents"]["contents"]) == len(local_only)

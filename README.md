@@ -6,10 +6,12 @@ A FastAPI webhook server for the **LINE Messaging API** that receives user messa
 
 - **LINE Signature Verification**: Verifies `X-Line-Signature` (HMAC-SHA256) on every incoming webhook request.
 - **Automatic Stateless Channel Access Tokens (v3)**: Authenticates with LINE using only `LINE_CHANNEL_ID` and `LINE_CHANNEL_SECRET` via `POST https://api.line.me/oauth2/v3/token`, with automatic caching and refresh (or optional static `LINE_CHANNEL_ACCESS_TOKEN`).
-- **In-Process Qwen AI Models + Interactive Model Switcher Card**: Runs quantized Qwen GGUF models locally in-process (`llama-cpp-python`, or PyTorch `transformers` / Ollama). Users can type `/model` (or `เปลี่ยนโมเดล` / tap the **Change Model** quick-reply chip) in LINE to open a Flex Message carousel card and switch between:
-  - **Qwen 2.5 0.5B** (`Fast`, 409 MB) — fastest everyday replies
-  - **Qwen 3 0.6B** (`Balanced`, 378 MB) — next-gen Qwen3 instruction following
-  - **Qwen 2.5 1.5B** (`Smart`, 718 MB) — 3× larger model for smarter reasoning and richer Thai & English replies
+- **In-Process Qwen AI Models + Google Gemini Cloud + Interactive Model Switcher Card**: Users can type `/model` (or `เปลี่ยนโมเดล` / tap the **Change Model** quick-reply chip) in LINE to open a Flex Message carousel card and switch between:
+  - **Qwen 2.5 0.5B** (`Local · Fast`, 409 MB) — fastest local replies
+  - **Qwen 3 0.6B** (`Local · Balanced`, 378 MB) — next-gen local Qwen3
+  - **Qwen 2.5 1.5B** (`Local · Smart`, 718 MB) — 3× larger local model for richer Thai & English replies
+  - **Gemini 3.5 Lite** (`Google · Free`) — fast Google Gemini cloud model on free tier (requires `GEMINI_API_KEY`)
+  - **Gemini 3.8 Flash** (`Google · Smart`) — flagship Google Gemini Flash with automatic fallback to Gemini 3.5 Lite when busy (requires `GEMINI_API_KEY`)
 - **Container-Ready**: Includes `Dockerfile`, `docker-compose.yml`, `railway.toml`, and `render.yaml` with CPU-only PyTorch, baked-in model weights, and non-blocking startup (`QWEN_PRELOAD_IN_BACKGROUND=true`).
 - **Responsive UX**: Returns `200 OK` to LINE immediately, shows the LINE typing/loading animation in 1-on-1 chats while generating, and replies asynchronously.
 - **Conversation Memory**: Keeps per-chat history (send `/reset` or `/clear` in LINE to reset context).

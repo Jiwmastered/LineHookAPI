@@ -15,6 +15,7 @@ from app.models_catalog import (
     MODEL_CATALOG,
     build_default_quick_reply,
     build_model_selector_flex,
+    get_available_models,
 )
 from app.qwen_service import QwenService
 
@@ -90,9 +91,9 @@ async def handle_line_event(
                 [
                     {
                         "type": "text",
-                        "text": "Welcome! Pick a Qwen AI model below or send any message to start chatting. Type /model anytime to switch models.",
+                        "text": "Welcome! Pick an AI model below or send any message to start chatting. Type /model anytime to switch models.",
                     },
-                    build_model_selector_flex(active_key),
+                    build_model_selector_flex(active_key, gemini_enabled=qwen_service.gemini_enabled),
                 ],
             )
         except Exception:
@@ -106,21 +107,23 @@ async def handle_line_event(
         model_key = (params.get("model") or [""])[0]
 
         if action == "select_model":
-            if model_key not in MODEL_CATALOG:
+            available = get_available_models(gemini_enabled=qwen_service.gemini_enabled)
+            if model_key not in available:
                 active_key = qwen_service.get_chat_model_key(chat_id)
                 try:
                     await line_client.reply_messages(
                         reply_token,
                         [
-                            {"type": "text", "text": "Unknown model selection. Please pick one below:"},
-                            build_model_selector_flex(active_key),
+                            {"type": "text", "text": "That model is unavailable. Please pick one below:"},
+                            build_model_selector_flex(active_key, gemini_enabled=qwen_service.gemini_enabled),
                         ],
                     )
                 except Exception:
                     logger.exception("Failed to send invalid-model fallback for %s", chat_id)
                 return
 
-            _maybe_start_loading(source, line_client)
+            if available[model_key].provider == "local":
+                _maybe_start_loading(source, line_client)
             try:
                 started_at = time.monotonic()
                 spec = await qwen_service.select_model(chat_id, model_key)
@@ -171,7 +174,7 @@ async def handle_line_event(
         try:
             await line_client.reply_messages(
                 reply_token,
-                [build_model_selector_flex(active_key)],
+                [build_model_selector_flex(active_key, gemini_enabled=qwen_service.gemini_enabled)],
             )
         except Exception:
             logger.exception("Failed to send model selector card for %s", chat_id)
@@ -285,7 +288,8 @@ def create_app(
             "backend": cfg.qwen_backend,
             "model": svc.active_model_name,
             "loaded_model_key": svc.loaded_model_key,
-            "available_models": list(MODEL_CATALOG.keys()),
+            "available_models": list(get_available_models(gemini_enabled=svc.gemini_enabled).keys()),
+            "gemini_enabled": svc.gemini_enabled,
             "model_loaded": svc.is_loaded,
         }
 

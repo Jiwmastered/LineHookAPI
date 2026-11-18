@@ -61,6 +61,10 @@ class QwenService:
         self._http: httpx.AsyncClient | None = None
 
     @property
+    def gemini_enabled(self) -> bool:
+        return bool(self.settings.gemini_api_key.strip())
+
+    @property
     def is_loaded(self) -> bool:
         if self.settings.qwen_backend == "ollama":
             return True
@@ -114,8 +118,14 @@ class QwenService:
             await self._ensure_model_loaded_locked(target_key)
 
     async def select_model(self, chat_id: str, model_key: str) -> ModelSpec:
-        """Switch the active model for chat_id and preload it in memory."""
+        """Switch the active model for chat_id and preload it when using a local model."""
         spec = self.get_model_spec(model_key)
+        if spec.provider == "gemini":
+            if not self.gemini_enabled:
+                raise ValueError("GEMINI_API_KEY is not configured on the server.")
+            self._chat_models[chat_id] = model_key
+            return spec
+
         self._chat_models[chat_id] = model_key
 
         if self.settings.qwen_backend != "ollama":
@@ -289,7 +299,9 @@ class QwenService:
         spec = self.get_model_spec(model_key)
         messages = self._build_messages(chat_id, user_message, spec)
 
-        if self.settings.qwen_backend == "ollama":
+        if spec.provider == "gemini":
+            reply = await self._generate_gemini(messages, spec)
+        elif self.settings.qwen_backend == "ollama":
             reply = await self._generate_ollama(messages, spec)
         elif self.settings.qwen_backend == "llamacpp":
             async with self._infer_lock:
@@ -357,6 +369,94 @@ class QwenService:
         input_length = model_inputs["input_ids"].shape[1]
         output_ids = generated_ids[0][input_length:]
         return self._tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+
+    async def _call_gemini_endpoint(
+        self,
+        model_id: str,
+        payload: dict[str, Any],
+    ) -> httpx.Response:
+        if self._http is None:
+            self._http = httpx.AsyncClient(timeout=45.0)
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
+        headers = {
+            "x-goog-api-key": self.settings.gemini_api_key.strip(),
+            "Content-Type": "application/json",
+        }
+        return await self._http.post(url, headers=headers, json=payload)
+
+    async def _generate_gemini(self, messages: list[dict[str, str]], spec: ModelSpec) -> str:
+        if not self.gemini_enabled:
+            return "Google Gemini API key is not configured on the server."
+
+        system_text = ""
+        contents: list[dict[str, Any]] = []
+        for msg in messages:
+            role = msg["role"]
+            text = msg["content"]
+            if role == "system":
+                system_text = text
+            elif role == "assistant":
+                contents.append({"role": "model", "parts": [{"text": text}]})
+            else:
+                contents.append({"role": "user", "parts": [{"text": text}]})
+
+        payload: dict[str, Any] = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": self.settings.qwen_temperature,
+                "topP": self.settings.qwen_top_p,
+                "maxOutputTokens": self.settings.gemini_max_output_tokens,
+            },
+        }
+        if system_text:
+            payload["systemInstruction"] = {"parts": [{"text": system_text}]}
+
+        response = await self._call_gemini_endpoint(spec.gemini_model, payload)
+        used_fallback = False
+
+        # Free tier can occasionally return 503 (temporary spike); retry once or fall back to Flash-Lite
+        if response.status_code == 503:
+            await asyncio.sleep(1.5)
+            response = await self._call_gemini_endpoint(spec.gemini_model, payload)
+
+        if response.status_code in (429, 503) and spec.gemini_fallback_model:
+            logger.warning(
+                "Gemini model '%s' returned %s; falling back to '%s'.",
+                spec.gemini_model,
+                response.status_code,
+                spec.gemini_fallback_model,
+            )
+            response = await self._call_gemini_endpoint(spec.gemini_fallback_model, payload)
+            used_fallback = response.status_code == 200
+
+        if response.status_code == 429:
+            return (
+                "Google Gemini free-tier rate limit reached right now. "
+                "Please wait a moment or tap 'Change Model' to use a local Qwen model."
+            )
+        if response.status_code == 503:
+            return (
+                "Google Gemini is temporarily busy. "
+                "Please try again shortly or tap 'Change Model' to switch models."
+            )
+
+        response.raise_for_status()
+        data = response.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return "Sorry, Google Gemini returned an empty response."
+
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        text_chunks = [
+            str(p.get("text", ""))
+            for p in parts
+            if p.get("text") and not p.get("thought", False)
+        ]
+        answer = "".join(text_chunks).strip()
+        if used_fallback and answer:
+            answer = f"{answer}\n\n(Answered via Gemini 3.5 Lite while Gemini 3.8 Flash was busy)"
+        return answer
 
     async def _generate_ollama(self, messages: list[dict[str, str]], spec: ModelSpec) -> str:
         if self._http is None:
