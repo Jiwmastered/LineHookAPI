@@ -1,6 +1,8 @@
 import asyncio
 import json
 import logging
+import sys
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -11,6 +13,25 @@ from app.line_client import LineClient, verify_signature
 from app.qwen_service import QwenService
 
 logger = logging.getLogger(__name__)
+
+
+def configure_logging(level_name: str) -> None:
+    """Route INFO/WARNING logs to stdout and ERROR+ to stderr (prevents Railway false error severity)."""
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(logging.DEBUG)
+    stdout_handler.addFilter(lambda record: record.levelno < logging.ERROR)
+    stdout_handler.setFormatter(formatter)
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.ERROR)
+    stderr_handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.setLevel(level)
+    root.handlers = [stdout_handler, stderr_handler]
 
 DUMMY_REPLY_TOKENS = {
     "00000000000000000000000000000000",
@@ -79,7 +100,10 @@ async def handle_line_event(
         )
 
     try:
+        started_at = time.monotonic()
         ai_reply = await qwen_service.generate_reply(chat_id, user_text)
+        elapsed = time.monotonic() - started_at
+        logger.info("Generated Qwen reply for %s in %.2fs (%d chars)", chat_id, elapsed, len(ai_reply))
         await line_client.reply_text(reply_token, ai_reply)
     except Exception:
         logger.exception("Error generating or sending reply for %s", chat_id)
@@ -99,10 +123,7 @@ def create_app(
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
 
-    logging.basicConfig(
-        level=getattr(logging, resolved_settings.log_level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+    configure_logging(resolved_settings.log_level)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

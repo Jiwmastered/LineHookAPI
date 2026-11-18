@@ -8,7 +8,7 @@ class FakeLlama:
     def __init__(self) -> None:
         self.calls: list[list[dict[str, str]]] = []
 
-    def create_chat_completion(self, *, messages, max_tokens, temperature, top_p):
+    def create_chat_completion(self, *, messages, max_tokens, temperature, top_p, **kwargs):
         self.calls.append(messages)
         last_user = messages[-1]["content"]
         return {

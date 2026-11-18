@@ -21,6 +21,22 @@ def clean_model_output(text: str) -> str:
     return cleaned or text.strip()
 
 
+def detect_cpu_threads(cap: int = 4) -> int:
+    """Detect effective CPU threads respecting Linux cgroup CPU quotas."""
+    try:
+        # cgroup v2: "<quota> <period>" or "max <period>"
+        cpu_max = Path("/sys/fs/cgroup/cpu.max")
+        if cpu_max.exists():
+            parts = cpu_max.read_text(encoding="utf-8").strip().split()
+            if len(parts) == 2 and parts[0] != "max":
+                quota, period = int(parts[0]), int(parts[1])
+                if quota > 0 and period > 0:
+                    return max(1, min(quota // period or 1, cap))
+    except Exception:
+        pass
+    return max(1, min(os.cpu_count() or 2, cap))
+
+
 class QwenService:
     """Runs a Qwen chat model locally in-process (llama.cpp GGUF or transformers) or via Ollama."""
 
@@ -90,7 +106,7 @@ class QwenService:
                 filename=self.settings.qwen_gguf_filename,
             )
 
-        n_threads = self.settings.qwen_n_threads or max(1, min(os.cpu_count() or 2, 4))
+        n_threads = self.settings.qwen_n_threads or detect_cpu_threads()
         logger.info(
             "Loading GGUF Qwen model from '%s' (n_ctx=%s, n_threads=%s)...",
             model_path,
@@ -102,6 +118,7 @@ class QwenService:
             model_path=model_path,
             n_ctx=self.settings.qwen_n_ctx,
             n_threads=n_threads,
+            n_threads_batch=n_threads,
             n_batch=128,
             use_mmap=True,
             use_mlock=False,
@@ -201,6 +218,7 @@ class QwenService:
             max_tokens=self.settings.qwen_max_new_tokens,
             temperature=self.settings.qwen_temperature,
             top_p=self.settings.qwen_top_p,
+            repeat_penalty=1.1,
         )
         choices = response.get("choices") or []
         if not choices:
